@@ -1,0 +1,376 @@
+---
+title: "Cho_SingleCell_QC.RMD"
+author: "Brian Muegge"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+options(width = 90)
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE)
+# The RMD file is in subdirectory scripts/. Change root directory to the main directory
+knitr::opts_knit$set(root.dir = "..")
+```
+
+# Overview
+
+To explore the physiologic role of motile primary cilia in human islets and potential link to metabolic disease, we examined ciliary gene expression in islet transcriptome studies from both healthy donors and individuals with type 2 diabetes.
+
+This code is the complete workflow to generate Figure 4D of the paper, looking at expression of ciliary genes in single cell RNA-seq data of human beta cells. 
+
+We use the publicly available dataset from Segerstolpe et al, Cell Metabolism, 2016 (doi: 10.1016/j.cmet.2016.08.020)
+
+This script will load the single cell RNA-seq count data, conduct standard QC analysis, and generate a filtered Seurat object to be used in downstream analytic pipelines. 
+
+Much of the approach in this code is inspired by the Harvard Bioinformatics Core scRNA-seq training course, accessed online May 2020 (https://hbctraining.github.io/scRNA-seq_online/schedule/links-to-lessons.html).
+
+## Block 1: Load libraries and set variables
+
+```{r libraries, results='hide', message=FALSE, warning=FALSE}
+library(SingleCellExperiment)
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(knitr)
+```
+
+```{r directories}
+# Store subdirectory paths as variables
+myWorkingDirectory = getwd()
+dataDirectory <- file.path(myWorkingDirectory,"data")
+figureOutputDirectory = file.path(myWorkingDirectory,"figures")
+resultsOutputDirectory = file.path(myWorkingDirectory,"results")
+```
+
+```{r thresholds}
+species <- "human" # or "mouse"
+minFeatures <- 100
+minCellsWithGene <- 25
+```
+
+```{r ggplotTheme}
+# colorblind palette. From http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/#a-colorblind-friendly-palette
+# The palette with black:
+cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7","#000000")
+
+my_theme <- theme_classic(base_size=10) +
+  theme(plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        legend.title = element_text(size=rel(1.25)),
+        axis.title = element_text(size = rel(1.25)),
+        text = element_text(face="bold"),
+        plot.margin=unit(c(0.25,0.25,0.25,0.25), "cm"))
+```
+
+## Block 2: Read in Cell count data
+
+The processed count matrix was downloaded from Array Express; https://www.ebi.ac.uk/arrayexpress/files/E-MTAB-5061/E-MTAB-5061.processed.1.zip
+
+The package was unzipped and the included file (pancreas_refseq_rpkms_counts_3514sc.txt) was stored in the *data/* subdirectory of this project.
+
+We load the count matrix for each sample. Only cells with at least `r minFeatures` genes detected are retained.
+
+```{r load}
+raw_data <- read.delim(file = file.path(dataDirectory,"pancreas_refseq_rpkms_counts_3514sc.txt"), sep="\t",quote ="",stringsAsFactors = FALSE,header=FALSE)
+
+# This file has samples names in line 1. The first element is #samples. There are 3514 samples
+#    The elements after the 3514th sample name are all "NA"
+sampleNames <- raw_data[1,]
+sampleNames <- sampleNames[!is.na(sampleNames)]
+sampleNames <- sampleNames[-1]
+
+# line 2 and beyond contain the data. 
+## Column 1 is gene name. 
+## Column 2 is accession. 
+## Columns 3-3516 are rpkm. 
+## Columns 3517:7030 are counts
+# Rows through 26180 contain the genes. 
+# The rows after that are spike-in and gfp matches
+
+gene_data <- raw_data[2:26180,1:2]
+colnames(gene_data) <- c("SYMBOL","ACCESSION")
+row.names(gene_data) <- make.unique(gene_data$SYMBOL)
+
+counts_data <- raw_data[2:26180,c(3517:7030)]
+colnames(counts_data) <- sampleNames
+row.names(counts_data) <- row.names(gene_data)
+
+# The cells are named by plate. 
+## The underscore separator identifies the well in the plat
+# Several plates are flagged as T2D. Pull out for metadata
+
+plateNumber <- gsub("_.*$","",colnames(counts_data))
+disease <- str_detect(plateNumber,"T2D")
+disease[disease=="TRUE"] <- "T2D"
+disease[disease=="FALSE"] <- "Control"
+
+kable(table(plateNumber))
+kable(table(disease))
+
+metadata <- data.frame(row.names = colnames(counts_data), 
+                    "Plate"=plateNumber,"Disease"=disease)
+
+seurat_obj <- CreateSeuratObject(counts = counts_data,
+                    min.features = minFeatures,
+                    min.cells = minCellsWithGene,
+                    project="Pancreas",
+                    meta.data = metadata)
+```
+
+## Block 3: Add metadata
+
+We compute additional metadata for each sample, including the percentage of genes that are mitochondrial.
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+seurat_obj$log10GenesPerUMI <- log10(seurat_obj$nFeature_RNA) / log10(seurat_obj$nCount_RNA)
+```
+
+*** Note : I don't clearly see mitochondrial genes included in this dataset ***
+
+```{r mito}
+# Compute percent mito ratio
+if(species=="human"){
+  seurat_obj$mitoRatio <- PercentageFeatureSet(object=seurat_obj,pattern = "^MT-")
+} else if (species=="mouse"){
+    seurat_obj$mitoRatio <- PercentageFeatureSet(object=seurat_obj,pattern="^mt-")
+} else {stop(cat("Provided species:",species,
+                 "is neither 'human' nor 'mouse'.","Try again.\n\n"))
+}
+
+seurat_obj$mitoRatio <- seurat_obj@meta.data$mitoRatio / 100
+```
+
+```{r}
+# Extract metadata dataframe
+metadata <- seurat_obj@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+  dplyr::rename(nUMI = nCount_RNA,
+                nGene = nFeature_RNA)
+```
+
+```{r}
+# Add metadata back to Seurat object
+seurat_obj@meta.data <- metadata
+
+# remove plateNumber and disease vectors so no later conflict with metadata entries
+rm(plateNumber,disease)
+```
+
+The unfiltered Seurat object, with metadata, is saved in:
+    data/seurat_unfiltered.RDS
+
+```{r}
+saveRDS(seurat_obj, file.path(dataDirectory,"seurat_unfiltered.RDS"))
+```
+
+## Block 4: Quality Control Metrics
+
+### Number of cells per plate
+
+This was a plate based project in 384 well plates
+
+```{r cellsPerPlate}
+# Visualize the number of cell counts per plate
+metadata %>% 
+  ggplot(aes(x=orig.ident, fill=Disease)) + 
+  geom_bar(stat="count",colour="black") +
+  scale_fill_manual(values=cbPalette) +
+  my_theme +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  ggtitle("Total Number of Cells") +
+  xlab("Plate Name")
+```
+
+### Number of Features and Genes per Cell
+
+Each RNA molecule sequenced is counted as a feature or UMI. A single feature represents a single RNA molecule detected. The number of features's detected is related to the depth of sequencing.
+
+```{r FeaturePerCell}
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  ggplot(aes(x=nUMI, fill= orig.ident,color=orig.ident)) + 
+  geom_density(alpha = 0.6) + 
+  scale_x_log10() + 
+  scale_fill_viridis_d(option="plasma") +
+  scale_color_viridis_d(option="plasma") +
+  my_theme +
+  ylab("Cell density") +
+  xlab("Number of Features") +
+  geom_vline(xintercept = 1.5E4, linetype="longdash")
+
+# plot each density plot separately per plate
+ggplot(data=metadata,aes(x=nUMI,fill= orig.ident)) + 
+  geom_density(color="black",alpha=0.6) + 
+  scale_x_log10() + 
+  scale_fill_viridis_d(option="plasma") +
+  ylab("Cell density") +
+  xlab("Number of Features") +
+  facet_wrap(facets=factor(metadata$orig.ident),nrow = 2) +
+  theme(axis.text.x = element_text(angle=70, hjust = 1))
+
+# plot as a function of disease
+metadata %>% 
+  ggplot(aes(x=nUMI, fill= Disease,color=Disease)) + 
+  geom_density(alpha = 0.6) + 
+  scale_x_log10() + 
+  scale_fill_manual(values=cbPalette) +
+  scale_color_manual(values=muted(cbPalette)) +
+  my_theme +
+  ylab("Cell density") +
+  xlab("Number of Features") +
+  geom_vline(xintercept = 1.5E4, linetype="longdash")
+```
+
+Most plates have a bimodal distribution of feature counts, with a small number of cells (wells) showing ~ 1000 features and the majority of cells with >100,000 features. A cut-off of about 1.5E4 (15,000 features) generally separates the clusters.
+
+Plate HP1509101 has a flat/unimodal distribution, which argues some sort of technical failure in library generation for that plate. Consider removing this from downstream analysis
+
+```{r} 
+# set this number based on visual plot above to use as a later filtering threshold
+minUMI <- 1.5E4
+```
+
+__We will use a fitering threshold that requires at least `r minUMI` UMI's per cell.__
+
+### Genes detected per cell
+
+```{r genesPerCell}
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  ggplot(aes(x=nGene, fill= orig.ident,color=orig.ident)) + 
+  geom_density(alpha = 0.6) + 
+  scale_x_log10() +
+  scale_fill_viridis_d(option="plasma") +
+  scale_color_viridis_d(option="plasma") +
+  my_theme +
+  geom_vline(xintercept = 1500, linetype="longdash") +
+  ylab("Cell Density") +
+  xlab("Number of Genes")
+
+# plot each density plot separately per plate
+ggplot(data=metadata,aes(x=nGene,fill= orig.ident)) + 
+  geom_density(color="black",alpha=0.6) + 
+  scale_x_log10() + 
+  scale_fill_viridis_d(option="plasma") +
+  ylab("Cell density") +
+  xlab("Number of Genes") +
+  facet_wrap(facets=factor(metadata$orig.ident),nrow = 2) +
+  theme(axis.text.x = element_text(angle=70, hjust = 1))
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  ggplot(aes(x=orig.ident, y=nGene, fill=orig.ident)) + 
+  geom_boxplot() + 
+  scale_fill_viridis_d(option="plasma") +
+  my_theme +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  ggtitle("Number of Genes per Cell")
+```
+
+The data suggests a cut-off of approximately 1500 genes per cell to separate the left peak (low genes per cell) from the more abundance, high quality peaks with >5000 genes per cell.
+
+Plate HP1509101 again is an outlier, with a much lower density of cells sequenced deeply.
+
+```{r} 
+# set this number based on visual plot above
+minGene <- 1500
+```
+
+Like with UMI counts, there is a tail of cells with lower gene count, probably representing cells that failed during library prep.
+
+__We will use a fitering threshold that requires at least `r minGene` genes per cell.__
+
+## Block 5: Filter out low quality cells
+
+We will remove cells with insufficient numbers of genes and UMIs, using the thresholds we identified above.
+
+As a reminder, we will require:
+1. At least `r minGene` genes per cell.
+2. At least `r minUMI` UMIs per cell.
+
+```{r filterSeurat}
+filtered_seurat <- subset(x = seurat_obj, 
+                          subset= (nUMI >= minUMI) & 
+                            (nGene >= minGene))
+```
+
+We began with `r ncol(seurat_obj)` cells in our dataset. After filtering, `r ncol(filtered_seurat)` cells remain (`round(100*((ncol(seurat_obj) - ncol(filtered_seurat)) / ncol(seurat_obj)),1)`% of cells removed).
+
+Additionally, we need to remove genes that are detected very rarely or only in a small number of cells. In single cell RNA-seq, many genes have zero counts in most cells and very low counts in other cells. Removing these genes improves statistical analysis in later steps.
+
+In this dataset of ~3,000 cells, we will require that a gene be detected in at least `r minCellsWithGene` cells to be retained. If the user is interested in ultra rare populations of cells, this threshold should be adjusted to a lower number.
+
+```{r geneFilter}
+# Extract the count matrix for each gene in each cell
+counts <- GetAssayData(object = filtered_seurat, slot = "counts")
+
+# Create a logical matrix with value TRUE if the gene count is not zero in that cell
+nonzero <- counts > 0
+
+# Sums all TRUE values and returns TRUE if more than 10 TRUE values per gene
+keep_genes <- Matrix::rowSums(nonzero) >= minCellsWithGene
+
+# Only keeping those genes expressed in at least the minimum number of cells
+filtered_counts <- counts[keep_genes, ]
+
+# Reassign to filtered Seurat object
+filtered_seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+```
+
+## Block 6: Re-assess QC metrics
+
+We will replot our QC metrics using the filtered object as a double check.
+
+```{r filteredQC}
+metadata <- filtered_seurat@meta.data
+
+# Cells per sample
+metadata %>% 
+  ggplot(aes(x=orig.ident, fill=Disease)) + 
+  geom_bar(stat="count",colour="black") +
+  scale_fill_manual(values=cbPalette) +
+  my_theme +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  ggtitle("Filtered Data: Total Number of Cells") +
+  xlab("Sample")
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  ggplot(aes(x=nUMI, fill= orig.ident,color=orig.ident)) + 
+  geom_density(alpha = 0.6) + 
+  scale_x_log10() + 
+  scale_fill_viridis_d(option="plasma") +
+  scale_color_viridis_d(option="plasma") +
+  my_theme +
+  ggtitle("Filtered Data: UMIs per cell") +
+  ylab("Cell density")
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  ggplot(aes(x=nGene, fill= orig.ident,color=orig.ident)) + 
+  geom_density(alpha = 0.6) + 
+  scale_fill_viridis_d(option="plasma") +
+  scale_color_viridis_d(option="plasma") +
+  my_theme +
+  scale_x_log10() + 
+  ggtitle("Filtered Data: Genes per Cell")
+```
+
+## Block 7: Save the filtered seurat object
+
+The filtered Seurat object is saved in the data directory for future use
+
+```{r}
+saveRDS(filtered_seurat, file.path(dataDirectory,"merged_filtered_seurat.RDS"))
+```
+
+## Session info
+
+```{r sessionInfo}
+sessionInfo()
+```

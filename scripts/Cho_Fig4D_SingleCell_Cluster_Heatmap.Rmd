@@ -1,0 +1,357 @@
+---
+title: "Cho_Fig4D_SingleCell_Cluster_Heatmap.RMD"
+author: "Brian Muegge"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+options(width = 90)
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE)
+# The RMD file is in subdirectory scripts/. Change root directory to the main directory
+knitr::opts_knit$set(root.dir = "..")
+```
+
+#Overview
+
+We previously loaded the raw sequencing data, performed quality control, and excluded poor quality cells and low frequency genes to create a filtered dataset.
+
+We will now cluster the cells and visualize ciliary gene expression by cell type and disease state.
+
+## Block 1: Load libraries and set variables
+
+
+```{r libraries, results='hide', message=FALSE, warning=FALSE}
+library(Seurat)
+library(tidyverse)
+```
+
+```{r directories}
+# Store subdirectory paths as variables
+myWorkingDirectory = getwd()
+dataDirectory <- file.path(myWorkingDirectory,"data")
+figureOutputDirectory = file.path(myWorkingDirectory,"figures")
+resultsOutputDirectory = file.path(myWorkingDirectory,"results")
+```
+
+```{r ggplotTheme}
+
+my_theme <- theme_classic(base_size=10) +
+  theme(plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        legend.title = element_text(size=rel(1.25)),
+        axis.title = element_text(size = rel(1.25)),
+        text = element_text(face="bold"),
+        plot.margin=unit(c(0.25,0.25,0.25,0.25), "cm"))
+```
+
+## Block 2: Load the filtered Seurat Object that we previously made
+
+```{r loadSeurat}
+filtered_seurat <- readRDS(file.path(dataDirectory,"merged_filtered_seurat.RDS"))
+```
+
+## Block 3: Normalization and scaling
+
+```{r sctransform}
+
+filtered_seurat <- NormalizeData(filtered_seurat, assay = "RNA", normalization.method = "LogNormalize", scale.factor = 10,000)
+
+filtered_seurat <- FindVariableFeatures(filtered_seurat, selection.method = "vst", nfeatures = 5000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(filtered_seurat), 10)
+
+# plot variable features with and without labels
+VariableFeaturePlot(filtered_seurat)
+
+all.genes <- rownames(filtered_seurat)
+filtered_seurat <- ScaleData(filtered_seurat, features = all.genes)
+```
+
+```{r}
+# Visualize
+# Run PCA
+filtered_seurat <- RunPCA(object = filtered_seurat)
+
+# Plot PCA
+PCAPlot(filtered_seurat,
+        split.by = "Disease",ncol=2) + NoLegend()
+```
+
+```{r}
+# Look at load on PC's
+print(filtered_seurat[["pca"]],dims = 1:5, nfeatures = 10)
+
+ElbowPlot(filtered_seurat)
+DimHeatmap(filtered_seurat, dims=1:6, cells=500, balanced = TRUE)
+DimHeatmap(filtered_seurat, dims=7:12, cells=500, balanced = TRUE)
+DimHeatmap(filtered_seurat, dims=13:15, cells=500, balanced = TRUE)
+```
+
+The load is fading out by PC 11 or 122.
+
+### Graph-based clustering
+
+For datasets of 3,000 - 5,000 cells, the resolution set between 0.4-1.4 generally yields good clustering. 
+
+The FindClusters() function allows us to enter a series of resolutions and will calculate the "granularity" of the clustering. This is very helpful for testing which resolution works for moving forward without having to run the function for each resolution.
+
+```{r findNeighorsClusters}
+numPC <- 30
+
+# first, rerun UMAP using the selected number of dimensions
+filtered_seurat <- RunUMAP(filtered_seurat, dims = 1:numPC, verbose = FALSE)
+
+# Determine the K-nearest neighbor graph
+filtered_seurat <- FindNeighbors(object = filtered_seurat,dims = 1:numPC)
+                                
+# Determine the clusters for various resolutions. Could go 0.2 to 2   
+filtered_seurat <- FindClusters(object = filtered_seurat,
+                 resolution = c(0.4,0.6,0.8,1.0,1.2,1.4,1.6))
+```
+
+###Plot the Clusters
+
+To choose a resolution to start with, typically pick something in the middle of the range like 0.6 or 0.8. 
+
+```{r}
+# Assign identity of clusters.  Note the text can change depending on input. look in metadata for actual name
+Idents(object = filtered_seurat) <- filtered_seurat@meta.data$RNA_snn_res.0.4
+
+# Plot the UMAP
+DimPlot(filtered_seurat,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 6) + ggtitle("Resolution 0.4")
+
+Idents(object = filtered_seurat) <- filtered_seurat@meta.data$RNA_snn_res.0.6
+
+# Plot the UMAP
+DimPlot(filtered_seurat,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 6) + ggtitle("Resolution 0.6")
+
+Idents(object = filtered_seurat) <- filtered_seurat@meta.data$RNA_snn_res.0.8
+
+# Plot the UMAP
+DimPlot(filtered_seurat,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 6) + ggtitle("Resolution 0.8")
+```
+
+I like resolution 0.6 the best. All outgroups have their own label, but not overly split.
+
+```{r}
+Idents(object = filtered_seurat) <- filtered_seurat@meta.data$RNA_snn_res.0.6
+```
+
+## Block 5: Cluster Identification using known cell type markers
+
+First, ensure that the default assay is RNA, not variable features
+```{r}
+DefaultAssay(filtered_seurat) <- "RNA"
+```
+
+### Exocrine Acinar markers (PRSS1)
+
+```{r}
+FeaturePlot(filtered_seurat,
+             reduction = "umap", 
+             features = c("PRSS1"), 
+             order = TRUE,
+             min.cutoff = 'q10', 
+             label = TRUE)
+```
+
+Acinar cells are cluster 6.
+
+### Exocrine Ductal markers (KRT19)
+
+```{r}
+FeaturePlot(filtered_seurat,
+             reduction = "umap", 
+             features = c("KRT19"), 
+             order = TRUE,
+             min.cutoff = 'q10', 
+             label = TRUE)
+```
+
+Ductal cells are clusters 2 and 4.
+
+### Pancreatic Stellate Cells (TIMP1, FN1, POSTN, ACTA2)
+
+```{r}
+FeaturePlot(filtered_seurat,
+            reduction = "umap",
+            features = c("TIMP1","FN1","POSTN","ACTA2"), 
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+```
+Stellate cells are cluster 13
+
+### Alpha Cells (GCG)
+
+```{r}
+FeaturePlot(filtered_seurat,
+            reduction = "umap",
+            features = c("GCG"), 
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+```
+
+Alpha cells are 0, 1, 5, 9, 11, 12, and 15.
+
+### Beta Cells (INS)
+
+```{r}
+FeaturePlot(filtered_seurat,
+            reduction = "umap",
+            features = c("INS"), 
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+```
+
+Beta cells are cluster 7, 10, and 14
+
+### Delta Cells (SST)
+
+```{r}
+FeaturePlot(filtered_seurat,
+            reduction = "umap",
+            features = c("SST"), 
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+```
+
+Delta cells are cluster 8.
+
+### Gamma Cells (PPY)
+
+```{r}
+FeaturePlot(filtered_seurat,
+            reduction = "umap",
+            features = c("PPY"), 
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+```
+
+Gamma cells are cluster 3.
+
+## Block 7: Relabel Clusters
+
+```{r}
+# Rename all identities
+filtered_seurat <- RenameIdents(object = filtered_seurat, 
+                               "0" = "Alpha",
+                               "1" = "Alpha",
+                               "2" = "Ductal",
+                               "3" = "Gamma",
+                               "4" = "Ductal",
+                               "5" = "Alpha",
+                               "6" = "Acinar",
+                               "7" = "Beta",
+                               "8" = "Delta",
+                               "9" = "Alpha",
+                               "10" = "Beta",
+                               "11" = "Alpha",
+                               "12" = "Alpha",
+                               "13" = "PSC",
+                               "14" = "Beta",
+                               "15" = "Alpha")
+
+# Stash these cell names
+filtered_seurat[["Pancreatic_CellTypes"]] <- Idents(filtered_seurat)
+
+DimPlot(filtered_seurat,cols = DiscretePalette(n=7,palette = "glasbey")) + theme(legend.text = element_text(size=16),legend.key.size = unit(1.5,'lines'))
+
+
+DotPlot(filtered_seurat,features = c("PRSS1","KRT19","FN1","GCG","INS","SST","PPY")) + RotatedAxis()
+
+```
+
+## Block 8: Split Cells by Disease
+
+```{r}
+
+# For simplicity, remove the exocrine and PSC cells
+seurat.subset <- subset(filtered_seurat,ident = c("Alpha","Beta","Delta","Gamma"))
+
+cellDisease <- paste0(seurat.subset@active.ident,".",seurat.subset@meta.data$Disease)
+
+cellDisease <- factor(cellDisease,levels = 
+                      c("Alpha.Control","Alpha.T2D", 
+                        "Beta.Control","Beta.T2D",
+                        "Delta.Control","Delta.T2D",
+                        "Gamma.Control","Gamma.T2D"))
+
+seurat.subset <- SetIdent(seurat.subset,value=cellDisease)
+
+seurat.subset[["Cell_Disease_Ident"]]<-Idents(seurat.subset)
+
+DimPlot(seurat.subset,
+        cols = DiscretePalette(n=8, palette = "glasbey")) +
+        theme(legend.text = element_text(size=16), 
+              legend.key.size = unit(1.5,'lines'))
+
+```
+
+
+## Block 9: Ciliary Gene expression in alpha and beta cells
+
+First, average the expression of every gene by cell type
+
+```{r}
+# cluster averages
+endocrine.cluster.averages <- AverageExpression(seurat.subset,return.seurat = TRUE)
+```
+
+Figure 4D - heatmap of selected ciliary genes in alpha and beta cells
+
+```{r}
+# selected cilia genes. culled from Cilia Carta and literature review
+
+selectCilia <- c("IFT57", "DNAAF2", "IFT80", "SPAG16", "DYNC2H1", "GALNT11", "IFT52", "DYNC2LI1", "DCTN5", "HIF1A", "PAFAH1B1", "RGN", "DNAH5", "DNAJA1", "BBS2", "ING2", "TMF1", "DNAAF2")
+
+selectCilia <- selectCilia[order(selectCilia,decreasing = FALSE)]
+
+# Subset average expression in  alpha and beta cells, split by disease
+alpha.beta.average.only <- subset(endocrine.cluster.averages,ident=c("Alpha.Control","Alpha.T2D","Beta.Control","Beta.T2D"))
+
+# Make a heatmap of ciliary gene expression
+
+DoHeatmap(alpha.beta.average.only,
+          features = selectCilia,
+          draw.lines = FALSE, size=2)
+
+pdf(file = file.path(figureOutputDirectory,"Fig4D_SelectCiliaGenes_AverageClusterExpression_Heatmap.pdf"),width = 4,height = 6,useDingbats = TRUE)
+
+DoHeatmap(alpha.beta.average.only,
+          features = selectCilia,
+          draw.lines = FALSE, size=2)
+dev.off()
+
+png(file = file.path(figureOutputDirectory,"Fig4D_SelectCiliaGenes_AverageClusterExpression_Heatmap.png"),width = 4, height = 6, units = "in", res = 300)
+
+DoHeatmap(alpha.beta.average.only,
+          features = selectCilia,
+          draw.lines = FALSE, size=2)
+dev.off()
+```
+
+## Block 10: Save the filtered, clustered seurat object
+
+```{r}
+saveRDS(filtered_seurat,file.path(dataDirectory,"filtered_seurat_clustered.RDS"))
+```
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
